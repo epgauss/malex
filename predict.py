@@ -3,13 +3,13 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 import _pickle as cPickle
+import os
 import sys
 import warnings
 
 
 START_TAG = '<START>'
 STOP_TAG = '<STOP>'
-
 
 def init_embedding(input_embedding):
     """
@@ -552,23 +552,27 @@ def predict(test_data, init_model, tag_to_id):
         # print('\n')
 
         sentence = " ".join(words)+"."
-        unt = [ word for word, tag in zip(words, temp_list_tags) if tag == "UNT"]
+        unt = [word for word, tag in zip(words, temp_list_tags) if tag == "UNT"]
+        print("unt: ", unt)
+
         if unt[0]:
             if len(unt) > 1:
                 untranslatables = ",".join(unt)
             else:
                 untranslatables = unt[0]
             print(untranslatables,'\t',sentence)
+        else:
+            raise "nothing, found"
     return
 
 
-def main(sentence_to_predict):
+def main(sentence_to_predict, dirname):
     warnings.filterwarnings("ignore")
     # parameters
     # To stored mapping file
     #mapping_file = 'model_v1_data.pkl'
-    mapping_file = 'model_v2_data.pkl'
-    model_file = 'model_v2'
+    mapping_file = dirname +'/model_v2_data.pkl'
+    model_file = dirname + '/model_v2'
     model_data = cPickle.load(open(mapping_file, "rb"))
     word_to_id = model_data['word_to_id']
     tag_to_id = model_data['tag_to_id']
@@ -618,9 +622,10 @@ def main(sentence_to_predict):
 
 if __name__== "__main__":
   args = sys.argv
+  dirname, _ = os.path.split(os.path.abspath(__file__))
   if len(args) > 1:
       sentence_to_predict = args[1]
-      main(sentence_to_predict)
+      main(sentence_to_predict, dirname)
   else:
       raise ValueError('what is sentence to predict (miust be a string)...')
 
