@@ -553,16 +553,15 @@ def predict(test_data, init_model, tag_to_id):
 
         sentence = " ".join(words)+"."
         unt = [word for word, tag in zip(words, temp_list_tags) if tag == "UNT"]
-        print("unt: ", unt)
 
-        if unt[0]:
+        if not unt:
+            raise "nothing, found"
+        else:
             if len(unt) > 1:
                 untranslatables = ",".join(unt)
             else:
                 untranslatables = unt[0]
             print(untranslatables,'\t',sentence)
-        else:
-            raise "nothing, found"
     return
 
 
@@ -621,11 +620,13 @@ def main(sentence_to_predict, dirname):
     predict(final_test_data, model, tag_to_id)
 
 if __name__== "__main__":
+
+  warnings.filterwarnings("ignore")
   args = sys.argv
   dirname, _ = os.path.split(os.path.abspath(__file__))
   if len(args) > 1:
       sentence_to_predict = args[1]
       main(sentence_to_predict, dirname)
   else:
-      raise ValueError('what is sentence to predict (miust be a string)...')
+      print('ERROR: provide a sentence (string) to predict ...')
 
