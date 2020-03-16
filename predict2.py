@@ -573,7 +573,7 @@ def main(sentences_to_predict, dirname, input_file_name):
     #mapping_file = 'model_v1_data.pkl'
     mapping_file = dirname +'/model_v2_data.pkl'
     model_file = dirname + '/model_v2'
-    output_file = dirname + '/' + input_file_name +'_out'
+    output_file = input_file_name +'_out'
     model_data = cPickle.load(open(mapping_file, "rb"))
     word_to_id = model_data['word_to_id']
     tag_to_id = model_data['tag_to_id']
@@ -628,7 +628,6 @@ if __name__== "__main__":
 
   if len(args) > 1:
       input_file_name = args[1]
-      input_file_path = dirname + "/" + input_file_name
       if os.path.exists(input_file_path):
           with open(input_file_path, "r", encoding='utf-8') as f_in:
               sentences_to_predict = f_in.readlines()
