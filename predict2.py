@@ -629,7 +629,7 @@ if __name__== "__main__":
   if len(args) > 1:
       input_file_name = args[1]
       if os.path.exists(input_file_path):
-          with open(input_file_path, "r", encoding='utf-8') as f_in:
+          with open(input_file_name, "r", encoding='utf-8') as f_in:
               sentences_to_predict = f_in.readlines()
               sentences_to_predict = [line for line in sentences_to_predict if line.strip()]
               sentences_to_predict = list(filter(None, sentences_to_predict))
