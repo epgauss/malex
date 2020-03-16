@@ -1,0 +1,642 @@
+import codecs
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+import _pickle as cPickle
+import os
+import sys
+import warnings
+
+
+START_TAG = '<START>'
+STOP_TAG = '<STOP>'
+
+def init_embedding(input_embedding):
+    """
+    Initialize embedding
+    """
+    bias = np.sqrt(3.0 / input_embedding.size(1))
+    nn.init.uniform(input_embedding, -bias, bias)
+
+def init_linear(input_linear):
+    """
+    Initialize linear transformation
+    """
+    bias = np.sqrt(6.0 / (input_linear.weight.size(0) + input_linear.weight.size(1)))
+    nn.init.uniform(input_linear.weight, -bias, bias)
+    if input_linear.bias is not None:
+        input_linear.bias.data.zero_()
+
+
+def init_lstm(input_lstm):
+    """
+    Initialize lstm
+
+    PyTorch weights parameters:
+
+        weight_ih_l[k]: the learnable input-hidden weights of the k-th layer,
+            of shape `(hidden_size * input_size)` for `k = 0`. Otherwise, the shape is
+            `(hidden_size * hidden_size)`
+
+        weight_hh_l[k]: the learnable hidden-hidden weights of the k-th layer,
+            of shape `(hidden_size * hidden_size)`
+    """
+
+    # Weights init for forward layer
+    for ind in range(0, input_lstm.num_layers):
+        ## Gets the weights Tensor from our model, for the input-hidden weights in our current layer
+        weight = eval('input_lstm.weight_ih_l' + str(ind))
+
+        # Initialize the sampling range
+        sampling_range = np.sqrt(6.0 / (weight.size(0) / 4 + weight.size(1)))
+
+        # Randomly sample from our samping range using uniform distribution and apply it to our current layer
+        nn.init.uniform(weight, -sampling_range, sampling_range)
+
+        # Similar to above but for the hidden-hidden weights of the current layer
+        weight = eval('input_lstm.weight_hh_l' + str(ind))
+        sampling_range = np.sqrt(6.0 / (weight.size(0) / 4 + weight.size(1)))
+        nn.init.uniform(weight, -sampling_range, sampling_range)
+
+    # We do the above again, for the backward layer if we are using a bi-directional LSTM (our final model uses this)
+    if input_lstm.bidirectional:
+        for ind in range(0, input_lstm.num_layers):
+            weight = eval('input_lstm.weight_ih_l' + str(ind) + '_reverse')
+            sampling_range = np.sqrt(6.0 / (weight.size(0) / 4 + weight.size(1)))
+            nn.init.uniform(weight, -sampling_range, sampling_range)
+            weight = eval('input_lstm.weight_hh_l' + str(ind) + '_reverse')
+            sampling_range = np.sqrt(6.0 / (weight.size(0) / 4 + weight.size(1)))
+            nn.init.uniform(weight, -sampling_range, sampling_range)
+
+    # Bias initialization steps
+
+    # We initialize them to zero except for the forget gate bias, which is initialized to 1
+    if input_lstm.bias:
+        for ind in range(0, input_lstm.num_layers):
+            bias = eval('input_lstm.bias_ih_l' + str(ind))
+
+            # Initializing to zero
+            bias.data.zero_()
+
+            # This is the range of indices for our forget gates for each LSTM cell
+            bias.data[input_lstm.hidden_size: 2 * input_lstm.hidden_size] = 1
+
+            # Similar for the hidden-hidden layer
+            bias = eval('input_lstm.bias_hh_l' + str(ind))
+            bias.data.zero_()
+            bias.data[input_lstm.hidden_size: 2 * input_lstm.hidden_size] = 1
+
+        # Similar to above, we do for backward layer if we are using a bi-directional LSTM
+        if input_lstm.bidirectional:
+            for ind in range(0, input_lstm.num_layers):
+                bias = eval('input_lstm.bias_ih_l' + str(ind) + '_reverse')
+                bias.data.zero_()
+                bias.data[input_lstm.hidden_size: 2 * input_lstm.hidden_size] = 1
+                bias = eval('input_lstm.bias_hh_l' + str(ind) + '_reverse')
+                bias.data.zero_()
+                bias.data[input_lstm.hidden_size: 2 * input_lstm.hidden_size] = 1
+
+
+def log_sum_exp(vec):
+    '''
+    This function calculates the score explained above for the forward algorithm
+    vec 2D: 1 * tagset_size
+    '''
+    max_score = vec[0, argmax(vec)]
+    max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
+    return max_score + torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
+
+
+def argmax(vec):
+    '''
+    This function returns the max index in a vector
+    '''
+    _, idx = torch.max(vec, 1)
+    return to_scalar(idx)
+
+
+def to_scalar(var):
+    '''
+    Function to convert pytorch tensor to a scalar
+    '''
+    return var.view(-1).data.tolist()[0]
+
+
+def score_sentences(self, feats, tags):
+    # tags is ground_truth, a list of ints, length is len(sentence)
+    # feats is a 2D tensor, len(sentence) * tagset_size
+    r = torch.LongTensor(range(feats.size()[0]))
+    if self.use_gpu:
+        r = r.cuda()
+        pad_start_tags = torch.cat([torch.cuda.LongTensor([self.tag_to_ix[START_TAG]]), tags])
+        pad_stop_tags = torch.cat([tags, torch.cuda.LongTensor([self.tag_to_ix[STOP_TAG]])])
+    else:
+        pad_start_tags = torch.cat([torch.LongTensor([self.tag_to_ix[START_TAG]]), tags])
+        pad_stop_tags = torch.cat([tags, torch.LongTensor([self.tag_to_ix[STOP_TAG]])])
+
+    score = torch.sum(self.transitions[pad_stop_tags, pad_start_tags]) + torch.sum(feats[r, tags])
+
+    return score
+
+
+def forward_alg(self, feats):
+    '''
+    This function performs the forward algorithm explained above
+    '''
+    # calculate in log domain
+    # feats is len(sentence) * tagset_size
+    # initialize alpha with a Tensor with values all equal to -10000.
+
+    # Do the forward algorithm to compute the partition function
+    init_alphas = torch.Tensor(1, self.tagset_size).fill_(-10000.)
+
+    # START_TAG has all of the score.
+    init_alphas[0][self.tag_to_ix[START_TAG]] = 0.
+
+    # Wrap in a variable so that we will get automatic backprop
+    forward_var = autograd.Variable(init_alphas)
+    if self.use_gpu:
+        forward_var = forward_var.cuda()
+
+    # Iterate through the sentence
+    for feat in feats:
+        # broadcast the emission score: it is the same regardless of
+        # the previous tag
+        emit_score = feat.view(-1, 1)
+
+        # the ith entry of trans_score is the score of transitioning to
+        # next_tag from i
+        tag_var = forward_var + self.transitions + emit_score
+
+        # The ith entry of next_tag_var is the value for the
+        # edge (i -> next_tag) before we do log-sum-exp
+        max_tag_var, _ = torch.max(tag_var, dim=1)
+
+        # The forward variable for this tag is log-sum-exp of all the
+        # scores.
+        tag_var = tag_var - max_tag_var.view(-1, 1)
+
+        # Compute log sum exp in a numerically stable way for the forward algorithm
+        forward_var = max_tag_var + torch.log(torch.sum(torch.exp(tag_var), dim=1)).view(1, -1)  # ).view(1, -1)
+    terminal_var = (forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]).view(1, -1)
+    alpha = log_sum_exp(terminal_var)
+    # Z(x)
+    return alpha
+
+
+def viterbi_algo(self, feats):
+    '''
+    In this function, we implement the viterbi algorithm explained above.
+    A Dynamic programming based approach to find the best tag sequence
+    '''
+    backpointers = []
+    # analogous to forward
+
+    # Initialize the viterbi variables in log space
+    init_vvars = torch.Tensor(1, self.tagset_size).fill_(-10000.)
+    init_vvars[0][self.tag_to_ix[START_TAG]] = 0
+
+    # forward_var at step i holds the viterbi variables for step i-1
+    forward_var = Variable(init_vvars)
+    if self.use_gpu:
+        forward_var = forward_var.cuda()
+    for feat in feats:
+        next_tag_var = forward_var.view(1, -1).expand(self.tagset_size, self.tagset_size) + self.transitions
+        _, bptrs_t = torch.max(next_tag_var, dim=1)
+        bptrs_t = bptrs_t.squeeze().data.cpu().numpy()  # holds the backpointers for this step
+        next_tag_var = next_tag_var.data.cpu().numpy()
+        viterbivars_t = next_tag_var[range(len(bptrs_t)), bptrs_t]  # holds the viterbi variables for this step
+        viterbivars_t = Variable(torch.FloatTensor(viterbivars_t))
+        if self.use_gpu:
+            viterbivars_t = viterbivars_t.cuda()
+
+        # Now add in the emission scores, and assign forward_var to the set
+        # of viterbi variables we just computed
+        forward_var = viterbivars_t + feat
+        backpointers.append(bptrs_t)
+
+    # Transition to STOP_TAG
+    terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
+    terminal_var.data[self.tag_to_ix[STOP_TAG]] = -10000.
+    terminal_var.data[self.tag_to_ix[START_TAG]] = -10000.
+    best_tag_id = argmax(terminal_var.unsqueeze(0))
+    path_score = terminal_var[best_tag_id]
+
+    # Follow the back pointers to decode the best path.
+    best_path = [best_tag_id]
+    for bptrs_t in reversed(backpointers):
+        best_tag_id = bptrs_t[best_tag_id]
+        best_path.append(best_tag_id)
+
+    # Pop off the start tag (we dont want to return that to the caller)
+    start = best_path.pop()
+    assert start == self.tag_to_ix[START_TAG]  # Sanity check
+    best_path.reverse()
+    return path_score, best_path
+
+
+def forward_calc(self, sentence, chars, chars2_length, d):
+    '''
+    The function calls viterbi decode and generates the
+    most probable sequence of tags for the sentence
+    '''
+
+    # Get the emission scores from the BiLSTM
+    feats = self._get_lstm_features(sentence, chars, chars2_length, d)
+    # viterbi to get tag_seq
+
+    # Find the best path, given the features.
+    if self.use_crf:
+        score, tag_seq = self.viterbi_decode(feats)
+    else:
+        score, tag_seq = torch.max(feats, 1)
+        tag_seq = list(tag_seq.cpu().data)
+
+    return score, tag_seq
+
+
+def get_lstm_features(self, sentence, chars2, chars2_length, d):
+    if self.char_mode == 'LSTM':
+
+        chars_embeds = self.char_embeds(chars2).transpose(0, 1)
+
+        packed = torch.nn.utils.rnn.pack_padded_sequence(chars_embeds, chars2_length)
+
+        lstm_out, _ = self.char_lstm(packed)
+
+        outputs, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(lstm_out)
+
+        outputs = outputs.transpose(0, 1)
+
+        chars_embeds_temp = Variable(torch.FloatTensor(torch.zeros((outputs.size(0), outputs.size(2)))))
+
+        if self.use_gpu:
+            chars_embeds_temp = chars_embeds_temp.cuda()
+
+        for i, index in enumerate(output_lengths):
+            chars_embeds_temp[i] = torch.cat(
+                (outputs[i, index - 1, :self.char_lstm_dim], outputs[i, 0, self.char_lstm_dim:]))
+
+        chars_embeds = chars_embeds_temp.clone()
+
+        for i in range(chars_embeds.size(0)):
+            chars_embeds[d[i]] = chars_embeds_temp[i]
+
+    if self.char_mode == 'CNN':
+        chars_embeds = self.char_embeds(chars2).unsqueeze(1)
+
+        ## Creating Character level representation using Convolutional Neural Netowrk
+        ## followed by a Maxpooling Layer
+        chars_cnn_out3 = self.char_cnn3(chars_embeds)
+        chars_embeds = nn.functional.max_pool2d(chars_cnn_out3,
+                                                kernel_size=(chars_cnn_out3.size(2), 1)).view(chars_cnn_out3.size(0),
+                                                                                              self.out_channels)
+
+        ## Loading word embeddings
+    embeds = self.word_embeds(sentence)
+
+    ## We concatenate the word embeddings and the character level representation
+    ## to create unified representation for each word
+    embeds = torch.cat((embeds, chars_embeds), 1)
+
+    embeds = embeds.unsqueeze(1)
+
+    ## Dropout on the unified embeddings
+    embeds = self.dropout(embeds)
+
+    ## Word lstm
+    ## Takes words as input and generates a output at each step
+    lstm_out, _ = self.lstm(embeds)
+
+    ## Reshaping the outputs from the lstm layer
+    lstm_out = lstm_out.view(len(sentence), self.hidden_dim * 2)
+
+    ## Dropout on the lstm output
+    lstm_out = self.dropout(lstm_out)
+
+    ## Linear layer converts the ouput vectors to tag space
+    lstm_feats = self.hidden2tag(lstm_out)
+
+    return lstm_feats
+
+
+def get_neg_log_likelihood(self, sentence, tags, chars2, chars2_length, d):
+    # sentence, tags is a list of ints
+    # features is a 2D tensor, len(sentence) * self.tagset_size
+    feats = self._get_lstm_features(sentence, chars2, chars2_length, d)
+
+    if self.use_crf:
+        forward_score = self._forward_alg(feats)
+        gold_score = self._score_sentence(feats, tags)
+        return forward_score - gold_score
+    else:
+        tags = Variable(tags)
+        scores = nn.functional.cross_entropy(feats, tags)
+        return scores
+
+
+class BiLSTM_CRF(nn.Module):
+
+    def __init__(self, vocab_size, tag_to_ix, embedding_dim, hidden_dim,
+                 char_to_ix=None, pre_word_embeds=None, char_out_dimension=25,
+                 char_embedding_dim=25, use_gpu=False,
+                 use_crf=True, char_mode='CNN', dropout=0.5):
+        '''
+        Input parameters:
+                vocab_size= Size of vocabulary (int)
+                tag_to_ix = Dictionary that maps NER tags to indices
+                embedding_dim = Dimension of word embeddings (int)
+                hidden_dim = The hidden dimension of the LSTM layer (int)
+                char_to_ix = Dictionary that maps characters to indices
+                pre_word_embeds = Numpy array which provides mapping from word embeddings to word indices
+                char_out_dimension = Output dimension from the CNN encoder for character
+                char_embedding_dim = Dimension of the character embeddings
+                use_gpu = defines availability of GPU,
+                    when True: CUDA function calls are made
+                    else: Normal CPU function calls are made
+                use_crf = parameter which decides if you want to use the CRF layer for output decoding
+        '''
+
+        super(BiLSTM_CRF, self).__init__()
+
+        # parameter initialization for the model
+        self.use_gpu = use_gpu
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.vocab_size = vocab_size
+        self.tag_to_ix = tag_to_ix
+        self.use_crf = use_crf
+        self.tagset_size = len(tag_to_ix)
+        self.out_channels = char_out_dimension
+        self.char_mode = char_mode
+        self.dropout = dropout
+
+        if char_embedding_dim is not None:
+            self.char_embedding_dim = char_embedding_dim
+
+            # Initializing the character embedding layer
+            self.char_embeds = nn.Embedding(len(char_to_ix), char_embedding_dim)
+            init_embedding(self.char_embeds.weight)
+
+            # Performing LSTM encoding on the character embeddings
+            if self.char_mode == 'LSTM':
+                self.char_lstm = nn.LSTM(char_embedding_dim, char_lstm_dim, num_layers=1, bidirectional=True)
+                init_lstm(self.char_lstm)
+
+            # Performing CNN encoding on the character embeddings
+            if self.char_mode == 'CNN':
+                self.char_cnn3 = nn.Conv2d(in_channels=1, out_channels=self.out_channels,
+                                           kernel_size=(3, char_embedding_dim), padding=(2, 0))
+
+        # Creating Embedding layer with dimension of ( number of words * dimension of each word)
+        self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
+        if pre_word_embeds is not None:
+            # Initializes the word embeddings with pretrained word embeddings
+            self.pre_word_embeds = True
+            self.word_embeds.weight = nn.Parameter(torch.FloatTensor(pre_word_embeds))
+        else:
+            self.pre_word_embeds = False
+
+        # Initializing the dropout layer, with dropout specificed in parameters
+        self.dropout = nn.Dropout(self.dropout)
+
+        # Lstm Layer:
+        # input dimension: word embedding dimension + character level representation
+        # bidirectional=True, specifies that we are using the bidirectional LSTM
+        if self.char_mode == 'LSTM':
+            self.lstm = nn.LSTM(embedding_dim + char_lstm_dim * 2, hidden_dim, bidirectional=True)
+        if self.char_mode == 'CNN':
+            self.lstm = nn.LSTM(embedding_dim + self.out_channels, hidden_dim, bidirectional=True)
+
+        # Initializing the lstm layer using predefined function for initialization
+        init_lstm(self.lstm)
+
+        # Linear layer which maps the output of the bidirectional LSTM into tag space.
+        self.hidden2tag = nn.Linear(hidden_dim * 2, self.tagset_size)
+
+        # Initializing the linear layer using predefined function for initialization
+        init_linear(self.hidden2tag)
+
+        if self.use_crf:
+            # Matrix of transition parameters.  Entry i,j is the score of transitioning *to* i *from* j.
+            # Matrix has a dimension of (total number of tags * total number of tags)
+            self.transitions = nn.Parameter(
+                torch.zeros(self.tagset_size, self.tagset_size))
+
+            # These two statements enforce the constraint that we never transfer
+            # to the start tag and we never transfer from the stop tag
+            self.transitions.data[tag_to_ix[START_TAG], :] = -10000
+            self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
+
+    # assigning the functions, which we have defined earlier
+    _score_sentence = score_sentences
+    _get_lstm_features = get_lstm_features
+    _forward_alg = forward_alg
+    viterbi_decode = viterbi_algo
+    neg_log_likelihood = get_neg_log_likelihood
+    forward = forward_calc
+
+
+def lower_case(x, lower=False):
+    if lower:
+        return x.lower()
+    else:
+        return x
+
+
+def get_chunk_type(tok, idx_to_tag):
+    """
+    The function takes in a chunk ("B-PER") and then splits it into the tag (PER) and its class (B)
+    as defined in BIOES
+
+    Args:
+        tok: id of token, ex 4
+        idx_to_tag: dictionary {4: "B-PER", ...}
+    Returns:
+        tuple: "B", "PER"
+    """
+
+    tag_name = idx_to_tag[tok]
+    tag_class = tag_name.split('-')[0]
+    tag_type = tag_name.split('-')[-1]
+    return tag_class, tag_type
+
+
+def get_chunks(seq, tags):
+    """Given a sequence of tags, group entities and their position
+    Args:
+        seq: [4, 4, 0, 0, ...] sequence of labels
+        tags: dict["O"] = 4
+    Returns:
+        list of (chunk_type, chunk_start, chunk_end)
+    Example:
+        seq = [4, 5, 0, 3]
+        tags = {"B-PER": 4, "I-PER": 5, "B-LOC": 3}
+        result = [("PER", 0, 2), ("LOC", 3, 4)]
+    """
+
+    # We assume by default the tags lie outside a named entity
+    default = tags["O"]
+
+    idx_to_tag = {idx: tag for tag, idx in tags.items()}
+
+    chunks = []
+
+    chunk_type, chunk_start = None, None
+    for i, tok in enumerate(seq):
+        # End of a chunk 1
+        if tok == default and chunk_type is not None:
+            # Add a chunk.
+            chunk = (chunk_type, chunk_start, i)
+            chunks.append(chunk)
+            chunk_type, chunk_start = None, None
+
+        # End of a chunk + start of a chunk!
+        elif tok != default:
+            tok_chunk_class, tok_chunk_type = get_chunk_type(tok, idx_to_tag)
+            if chunk_type is None:
+                # Initialize chunk for each entity
+                chunk_type, chunk_start = tok_chunk_type, i
+            elif tok_chunk_type != chunk_type or tok_chunk_class == "B":
+                # If chunk class is B, i.e., its a beginning of a new named entity
+                # or, if the chunk type is different from the previous one, then we
+                # start labelling it as a new entity
+                chunk = (chunk_type, chunk_start, i)
+                chunks.append(chunk)
+                chunk_type, chunk_start = tok_chunk_type, i
+        else:
+            pass
+
+    # end condition
+    if chunk_type is not None:
+        chunk = (chunk_type, chunk_start, len(seq))
+        chunks.append(chunk)
+
+    return chunks
+
+def predict(test_data, init_model, tag_to_id, output_file):
+    print("")
+    print("")
+    print("")
+
+    with open(output_file, "w", encoding='utf-8') as f_out:
+        for data in test_data:
+            words = [ word.encode('utf-8') for word in data['str_words']]
+            chars2 = data['chars']
+            d = {}
+            # Padding the each word to max word size of that sentence
+            chars2_length = [len(c) for c in chars2]
+            char_maxl = max(chars2_length)
+            chars2_mask = np.zeros((len(chars2_length), char_maxl), dtype='int')
+            for i, c in enumerate(chars2):
+                chars2_mask[i, :chars2_length[i]] = c
+            chars2_mask = Variable(torch.LongTensor(chars2_mask))
+
+            dwords = Variable(torch.LongTensor(data['words']))
+
+            # We are getting the predicted output from our model
+            # if use_gpu:
+            #    val, predicted_id = init_model(dwords.cuda(), chars2_mask.cuda(), chars2_length, d)
+            # else:
+            val, predicted_id = init_model(dwords, chars2_mask, chars2_length, d)
+
+            pred_chunks = get_chunks(predicted_id, tag_to_id)
+            temp_list_tags = ['NA'] * len(words)
+            for p in pred_chunks:
+                temp_list_tags[p[1]] = p[0]
+
+            # for word, tag in zip(words, temp_list_tags):
+            #    print(word, ':', tag)
+            # print('\n')
+            if words:
+                sentence = " ".join([word.decode('utf-8') for word in words])
+                unt = [word.decode('utf-8') for word, tag in zip(words, temp_list_tags) if tag == "UNT"]
+                if not unt:
+                    f_out.write(sentence  + " | " + '\n')
+                else:
+                    if len(unt) > 1:
+                        untranslatables = ",".join(unt)
+                    else:
+                        untranslatables = unt[0]
+                    f_out.write(sentence + " | " + untranslatables + '\n')
+            else:
+                print('\n')
+        print("Done, saved: '{}'".format(output_file))
+    return
+
+
+def main(sentences_to_predict, dirname, input_file_name):
+    warnings.filterwarnings("ignore")
+    # parameters
+    # To stored mapping file
+    #mapping_file = 'model_v1_data.pkl'
+    mapping_file = dirname +'/model_v2_data.pkl'
+    model_file = dirname + '/model_v2'
+    output_file = dirname + '/' + input_file_name +'_out'
+    model_data = cPickle.load(open(mapping_file, "rb"))
+    word_to_id = model_data['word_to_id']
+    tag_to_id = model_data['tag_to_id']
+    parameters = model_data['parameters']
+    lower = parameters['lower']
+    word_embeds = model_data['word_embeds']
+    char_to_id = model_data['char_to_id']
+
+    # creating the model using the Class defined above
+    model = BiLSTM_CRF(vocab_size=len(word_to_id),
+                   tag_to_ix=tag_to_id,
+                   embedding_dim=parameters['word_dim'],
+                   hidden_dim=parameters['word_lstm_dim'],
+                   use_gpu=False,
+                   char_to_ix=char_to_id,
+                   pre_word_embeds=word_embeds,
+                   use_crf=parameters['crf'],
+                   char_mode=parameters['char_mode'])
+
+    if torch.cuda.is_available():
+        map_location = lambda storage, loc: storage.cuda()
+    else:
+        map_location = 'cpu'
+
+    model.load_state_dict(torch.load(model_file, map_location=map_location))
+
+    #sentences_to_predict = ['Steve UN to Paris', 'Steve why to Paris', 'Elixir and from other']
+
+    try:
+        isinstance(sentences_to_predict, list)
+    except:
+        raise ValueError('must be a list...')
+    else:
+        model_testing_sentences = sentences_to_predict
+
+    # preprocessing
+    final_test_data = []
+    for sentence in model_testing_sentences:
+        s = sentence.split()
+        str_words = [w for w in s]
+        words = [word_to_id[lower_case(w, lower) if lower_case(w, lower) in word_to_id else '<UNK>'] for w in str_words]
+        # Skip characters that are not in the training set
+        chars = [[char_to_id[c] for c in w if c in char_to_id] for w in str_words]
+        final_test_data.append({'str_words': str_words, 'words': words, 'chars': chars, })
+
+    predict(final_test_data, model, tag_to_id, output_file)
+
+if __name__== "__main__":
+  warnings.filterwarnings("ignore")
+  args = sys.argv
+  dirname, _ = os.path.split(os.path.abspath(__file__))
+
+  if len(args) > 1:
+      input_file_name = args[1]
+      input_file_path = dirname + "/" + input_file_name
+      if os.path.exists(input_file_path):
+          with open(input_file_path, "r", encoding='utf-8') as f_in:
+              sentences_to_predict = f_in.readlines()
+              sentences_to_predict = [line for line in sentences_to_predict if line.strip()]
+              sentences_to_predict = list(filter(None, sentences_to_predict))
+              main(sentences_to_predict, dirname, input_file_name)
+      else:
+          print("No such file '{}'".format(input_file_name), file=sys.stderr)
+  else:
+      print("ERROR: provide an input file (same directory)...")
+
